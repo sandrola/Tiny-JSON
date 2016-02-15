@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -40,7 +40,7 @@ namespace Tiny.Bson
 		{
 			Type type = typeof(T);
 			IDictionary<string, object> bsonObj = DecodeDocument(byteArray);
-			BsonDecoder decoder = GetDecoder(type);
+			BsonDecoder decoder = GetBsonDecoder(type);
 			//return (T)decoder(type , )
 			return (T)decoder(type, bsonObj);
 		}
@@ -96,8 +96,7 @@ namespace Tiny.Bson
 						if (type.IsArray)
 						{
 							Type elementType = type.GetElementType();
-							bool isNullable = Nullable.GetUnderlyingType(elementType) != null
-								|| !elementType.IsPrimitive;
+							bool isNullable = IsNullable(elementType);
 							Array array = Array.CreateInstance(elementType, count);
 							for (int i = 0; i < count; i++)
 							{
@@ -113,7 +112,7 @@ namespace Tiny.Bson
 						{
 							IList instance = null;
 							Type genericType = type.GetGenericArguments()[0];
-							bool nullable = Nullable.GetUnderlyingType(genericType) != null || !genericType.IsPrimitive;
+							bool nullable = IsNullable(genericType);
 							if(type!= typeof(IList) && typeof(IList).IsAssignableFrom(type))
 							{
 								instance = Activator.CreateInstance(type, true) as IList;
@@ -136,9 +135,69 @@ namespace Tiny.Bson
 							return instance;
 						}
 					}
+					else if (bsonObject is Dictionary<string, object> || bsonObject is Dictionary<int, object>)
+					{
+						IDictionary bsonDict = bsonObject as IDictionary;
+						IDictionaryEnumerator enumerator = null;
+						if(null != bsonDict)
+						{
+							enumerator = bsonDict.GetEnumerator();
+						}
+						else
+						{
+							return null;
+						}
+
+						Type[] genericArgumentTypes= type.GetGenericArguments();
+						if(genericArgumentTypes.Length==2)
+						{
+							IDictionary instance = null;
+							Type keyType = genericArgumentTypes[0];
+							Type genericType = genericArgumentTypes[1];
+							bool nullable = IsNullable(genericType);
+							if(type!=typeof(IDictionary) && typeof(IDictionary).IsAssignableFrom(type))
+							{
+								instance = Activator.CreateInstance(type, true) as IDictionary;
+							}
+							else
+							{
+								Type genericDictType = typeof(Dictionary<,>).MakeGenericType(keyType, genericType);
+								instance = Activator.CreateInstance(genericDictType) as IDictionary;
+							}
+
+							while(enumerator.MoveNext())
+							{
+								DictionaryEntry entry = enumerator.Entry;
+
+								object value = DecodeValue(entry.Value, genericType);
+								object key = entry.Key;
+								if (keyType == typeof(int))
+								{
+									key = Convert.ToInt32(key);
+								}
+								if (null != value || nullable)
+								{
+									instance.Add(key, value);
+								}
+							}
+
+							return instance;
+						}
+					}
 				}
 
 				return null;
+			});
+
+			RegisterBsonDecoder<Enum>((type, bsonObject) => {
+				if(bsonObject is string)
+				{
+					return Enum.Parse(type, bsonObject as string);
+				}
+				else
+				{
+					return Enum.ToObject(type, bsonObject);
+				}
 			});
 		}
 
@@ -170,7 +229,6 @@ namespace Tiny.Bson
 					{
 						fieldInfo.SetValue(target, null);
 					}
-
 				}
 				targetType = targetType.BaseType;
 			}
@@ -181,10 +239,15 @@ namespace Tiny.Bson
 		{
 			if (value == null) return null;
 
+			if(IsSupported(value))
+			{
+				value = ConvertValue(value, targetType);
+			}
+
 			Type valueType = value.GetType();
 			if (!targetType.IsAssignableFrom(valueType))
 			{
-				BsonDecoder decoder = GetDecoder(targetType);
+				BsonDecoder decoder = GetBsonDecoder(targetType);
 				value = decoder(targetType, value);
 			}
 
@@ -199,7 +262,7 @@ namespace Tiny.Bson
 			}
 		}
 
-		static BsonDecoder GetDecoder(Type type)
+		static BsonDecoder GetBsonDecoder(Type type)
 		{
 			if (bsonDecoders.ContainsKey(type))
 			{
@@ -250,7 +313,7 @@ namespace Tiny.Bson
 					{
 						// String
 						name = GetDecodeName(reader);
-						value = GetString(reader);
+						value = DecodeString(reader);
 						break;
 					}
 				case 0x03:
@@ -336,11 +399,11 @@ namespace Tiny.Bson
 			}
 		}
 
-		private static string GetString(BinaryReader reader)
+		private static string DecodeString(BinaryReader reader)
 		{
 			int length = reader.ReadInt32();
 			byte[] buffer = reader.ReadBytes(length);
-			return Encoding.UTF8.GetString(buffer);
+			return Encoding.UTF8.GetString(buffer, 0, buffer.Length - 1);
 		}
 
 		private static string GetDecodeName(BinaryReader reader)
@@ -402,10 +465,18 @@ namespace Tiny.Bson
 			{
 				return bsonEncoders[type];
 			}
-			else
+
+			foreach (var entry in bsonEncoders)
 			{
-				return genericBsonEncoder;
+				Type baseType = entry.Key;
+				if (baseType.IsAssignableFrom(type))
+				{
+					return entry.Value;
+				}
 			}
+
+			return genericBsonEncoder;
+			
 		}
 
 		static void RegisterDefaultBsonEncoder()
@@ -416,13 +487,54 @@ namespace Tiny.Bson
 				EncodeDocument(stream, obj);
 			});
 
-			RegisterBsonEncoder<IEnumerable>((obj, stream)=>
+			RegisterBsonEncoder<IEnumerable>((obj, stream) =>
 			{
-				EncodeArray(obj as IEnumerable, stream);
-			}
-			);
+				if (obj is IDictionary)
+				{
+
+					MemoryStream dictStream = new MemoryStream();
+					IDictionary objDict = obj as IDictionary;
+					if (null != objDict)
+					{
+						IDictionaryEnumerator enumerator = objDict.GetEnumerator();
+
+						while (enumerator.MoveNext())
+						{
+							DictionaryEntry entry = enumerator.Entry;
+
+							object value = entry.Value;
+							string key = entry.Key.ToString();
+							if (null != value)
+							{
+								Type valueType = value.GetType();
+								EncodeElement(dictStream, key, valueType, value);
+							}
+							else
+							{
+								EncodeElement(dictStream, key, typeof(Nullable), null);
+							}
+						}
+					}
+
+					BinaryWriter bw = new BinaryWriter(stream);
+					bw.Write((Int32)(dictStream.Position + 4 + 1));
+					bw.Write(dictStream.GetBuffer(), 0, (int)dictStream.Position);
+					bw.Write((byte)0);
+				}
+				else
+				{
+					EncodeArray(obj as IEnumerable, stream);
+				}
+			});
+
 		}
 
+		
+		/// <summary>
+		/// 
+		/// </summary>
+		/// <typeparam name="T"></typeparam>
+		/// <param name="bsonEncoder"></param>
 		static void RegisterBsonEncoder<T>(BsonEncoder bsonEncoder)
 		{
 			Type type = typeof(T);
@@ -475,6 +587,14 @@ namespace Tiny.Bson
 						ms.WriteByte(0x05);
 						encodeCString(ms, name);
 						encodeBinary(ms, value as byte[]);
+					}
+					else if (typeof(IDictionary).IsAssignableFrom(type))
+					{
+						ms.WriteByte(0x03);
+						encodeCString(ms, name);
+
+						BsonEncoder encoder = GetBsonEncoder(type);
+						encoder(value, ms);
 					}
 					else if (type.IsArray || type.IsGenericType)
 					{
@@ -538,18 +658,21 @@ namespace Tiny.Bson
 
 			//for (int i = 0, length = array.Length; i < length; i++)
 			int i = 0;
-			foreach (var obj in objs)
+			if (null != objs)
 			{
-				if (null != obj)
+				foreach (var obj in objs)
 				{
-					Type objType = obj.GetType();
-					EncodeElement(arrayStream, i.ToString(), objType, obj);
+					if (null != obj)
+					{
+						Type objType = obj.GetType();
+						EncodeElement(arrayStream, i.ToString(), objType, obj);
+					}
+					else
+					{
+						EncodeElement(arrayStream, i.ToString(), typeof(Nullable), null);
+					}
+					i++;
 				}
-				else
-				{
-					EncodeElement(arrayStream, i.ToString(), typeof(Nullable), null);
-				}
-				i++;
 			}
 
 			BinaryWriter bw = new BinaryWriter(ms);
@@ -563,16 +686,19 @@ namespace Tiny.Bson
 		{
 			MemoryStream dms = new MemoryStream();
 
-			Type type = obj.GetType();
-
-			while (null != type)
+			if (null != obj)
 			{
-				FieldInfo[] fieldInfos = type.GetFields(defaultBindFlags);
-				foreach (FieldInfo field in fieldInfos)
+				Type type = obj.GetType();
+
+				while (null != type)
 				{
-					EncodeField(dms, field, obj);
+					FieldInfo[] fieldInfos = type.GetFields(defaultBindFlags);
+					foreach (FieldInfo field in fieldInfos)
+					{
+						EncodeField(dms, field, obj);
+					}
+					type = type.BaseType;
 				}
-				type = type.BaseType;
 			}
 
 			BinaryWriter bw = new BinaryWriter(ms);
@@ -583,10 +709,21 @@ namespace Tiny.Bson
 		
 		private static void encodeBinary(Stream ms, byte[] buf)
 		{
-			byte[] aBuf = BitConverter.GetBytes(buf.Length);
-			ms.Write(aBuf, 0, aBuf.Length);
+			byte[] lengthBuf = null;
+			if(null != buf )
+			{
+				lengthBuf = BitConverter.GetBytes(buf.Length);
+			}
+			else
+			{
+				lengthBuf = BitConverter.GetBytes(0);
+			}
+			ms.Write(lengthBuf, 0, lengthBuf.Length);
 			ms.WriteByte(0);
-			ms.Write(buf, 0, buf.Length);
+			if (null != buf)
+			{
+				ms.Write(buf, 0, buf.Length);
+			}
 		}
 
 		private static void encodeCString(Stream ms, string v)
@@ -598,11 +735,19 @@ namespace Tiny.Bson
 
 		private static void encodeString(Stream ms, string v)
 		{
-			byte[] strBuf = new UTF8Encoding().GetBytes(v);
-			byte[] buf = BitConverter.GetBytes(strBuf.Length + 1);
+			if (!string.IsNullOrEmpty(v))
+			{
+				byte[] strBuf = new UTF8Encoding().GetBytes(v);
+				byte[] lengthBuf = BitConverter.GetBytes(strBuf.Length + 1);
 
-			ms.Write(buf, 0, buf.Length);
-			ms.Write(strBuf, 0, strBuf.Length);
+				ms.Write(lengthBuf, 0, lengthBuf.Length);
+				ms.Write(strBuf, 0, strBuf.Length);
+			}
+			else
+			{
+				byte[] lengthBuf = BitConverter.GetBytes(1);
+				ms.Write(lengthBuf, 0, lengthBuf.Length);
+			}
 			ms.WriteByte(0);
 		}
 
@@ -661,6 +806,38 @@ namespace Tiny.Bson
 				return name.Substring(name.IndexOf("<") + 1, name.IndexOf(">") - 1);
 			}
 			return name;
+		}
+
+		public static bool IsNullable(Type type)
+		{
+			return Nullable.GetUnderlyingType(type) != null || !type.IsPrimitive;
+		}
+		
+		static object ConvertValue(object value, Type type)
+		{
+			if (value != null)
+			{
+				Type safeType = Nullable.GetUnderlyingType(type) ?? type;
+				if (!type.IsEnum)
+				{
+					return Convert.ChangeType(value, safeType);
+				}
+			}
+			return value;
+		}
+
+		internal static bool IsNumber(object value)
+		{
+			return value != null && value.GetType().IsNumeric();
+		}
+
+		internal static bool IsSupported(object obj)
+		{
+			if (obj == null) return true;
+			if (obj is bool) return true;
+			if (obj is string) return true;
+			if (IsNumber(obj)) return true;
+			return false;
 		}
 
 		#endregion FUNCTION
